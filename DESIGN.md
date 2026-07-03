@@ -4,26 +4,9 @@ This document details the architectural decisions, database design, and durabili
 
 ---
 
-## 1. Idempotency Key Design & Scoping
+## 1. System Architecture
 
-To guarantee exactly-once execution for mutating API requests (such as credits, debits, or purchases), we require clients to supply a unique `Idempotency-Key` (UUIDv4) header.
-
-### Scoping and Payload Mismatch Detection
-* **Key Scoping:** Idempotency keys are scoped **globally by key** in the database. The `idempotency_keys` table uses the client-provided key as the primary key constraint.
-* **Payload Fingerprinting:** To prevent a client from using the same idempotency key for two different requests (e.g. crediting a different amount or playerId), we calculate a SHA-256 request fingerprint hash:
-  `request_hash = SHA256(HTTP_METHOD + PATH + SERIALIZED_BODY)`
-* **Replay vs. Mismatch Error:**
-  - If a incoming request matches an existing key and the stored `request_hash` is identical, the system bypasses the business operation and replays the stored response (status code and body) deterministically.
-  - If the `request_hash` does not match, the request is rejected with `400 Bad Request` to notify the client of the key reuse bug.
-  - If the operation is currently executing in another transaction, concurrent requests block on the database constraint lock and eventually replay the completed response once the holding transaction commits.
-
----
-
-## 2. Database Schema, Constraints & Indexing
-
-The schema is built in PostgreSQL 16 and managed via SQLAlchemy and Alembic.
-
-### Entity Relationship & Tables
+Arcfield is designed around the principle of strict transactional isolation and idempotency. The system relies on a single relational database (PostgreSQL 16) to orchestrate and store all economy state (wallets, append-only ledgers, inventory, unique reward claims, and idempotency status).
 
 ```mermaid
 erDiagram
@@ -70,75 +53,72 @@ erDiagram
     WALLETS ||--o{ CLAIMED_REWARDS : "claims"
 ```
 
-### Essential Constraints & Indexes
-1. **`wallets` check constraint:**
-   - `chk_wallet_balance_non_negative`: `balance >= 0` ensures wallet balances can never drop below zero at the database level.
-2. **`ledger` check constraint & indexes:**
-   - `chk_ledger_balance_after_non_negative`: `balance_after >= 0` validates audit trail consistency.
-   - `idx_ledger_player_id`: Index on `player_id` to speed up audit logs query.
-   - `idx_ledger_reference_id`: Index on `reference_id` (the idempotency key) for tracking transactions.
-3. **`claimed_rewards` constraints:**
-   - `uq_player_reward`: Unique constraint on `(player_id, reward_id)` guarantees each player can claim a specific reward at most once.
-4. **`idempotency_keys` index:**
-   - `idx_idempotency_keys_created_at`: Index on `created_at` to allow rapid range queries for the background pruning cleanup.
+---
+
+## 2. Choosing PostgreSQL
+
+PostgreSQL was chosen as the primary data store due to its full support for ACID transactions, robust row-level exclusive locking, and standard constraint check capabilities. In a durable game economy, operations must never allow partial state updates or integrity violations (e.g., negative wallet balances or double reward claims).
 
 ---
 
-## 3. Transaction Isolation & Concurrency Control
+## 3. Transaction Boundaries & Isolation Level
 
-We evaluated three database transaction isolation levels for handling wallet mutations:
-
-| Isolation Level | Read Skew / Phantoms | Write Skew | Performance | Application Overhead |
-|:---|:---|:---|:---|:---|
-| **READ COMMITTED** | Possible | Possible | **High** | Low (Default DB state) |
-| **REPEATABLE READ** | Prevented | Possible | **Medium** | Medium (Requires retrying aborts on write conflicts) |
-| **SERIALIZABLE** | Prevented | Prevented | **Low** | High (Aborts frequently on concurrent writes) |
-
-### Chosen Strategy: `READ COMMITTED` with Pessimistic Row Locking (`SELECT FOR UPDATE`)
-
-To maximize concurrency and system throughput while maintaining absolute transaction consistency, we use **pessimistic row-level locking**:
-
-1. We insert a new wallet row if it does not exist using `ON CONFLICT DO NOTHING`.
-2. We query the wallet row using `SELECT ... FROM wallets WHERE player_id = :id FOR UPDATE`.
-3. PostgreSQL acquires an exclusive row-level write lock.
-4. Any concurrent transactions attempting to modify or lock the **same** wallet will block at step 2 until this transaction commits or rolls back.
-5. Concurrent transactions for **different** players proceed in parallel without any blocking or performance degradation.
-6. Check constraints (such as `balance >= 0`) are validated against the actual locked row state, preventing double-debiting.
-7. This removes the risk of serialization failures (aborts) seen in `REPEATABLE READ`/`SERIALIZABLE`, removing the need for complex application-level retry logic.
-
----
-
-## 4. Exactly-Once Transaction Flow
-
-All operations for a single request are bundled within a single SQL transaction block (`async with db.begin()`):
-
+### Single-Transaction Flow
+All modifications related to a single request occur within a single database transaction context:
+```python
+async with db.begin():
+    # Transaction Starts
+    # 1. Insert/Verify Idempotency Key
+    # 2. Lock Player's Wallet (SELECT ... FOR UPDATE)
+    # 3. Apply Mutations (debits, credits, inventory grants, claimed rewards)
+    # 4. Write Append-Only Ledger entry
+    # 5. Write Idempotency Response status & body
 ```
-Client Request
-      │
-      ▼
-Check UUID & Hash ──────► Database Transaction Starts
-                                │
-                                ├──► INSERT Idempotency Key (ON CONFLICT DO NOTHING)
-                                │       ├──► [New Key]
-                                │       │       ├──► INSERT/SELECT FOR UPDATE Wallet
-                                │       │       ├──► Update Wallet Balance
-                                │       │       ├──► INSERT Ledger Entry
-                                │       │       └──► UPDATE Idempotency Key with Response
-                                │       │
-                                │       └──► [Duplicate Key Conflict]
-                                │               └──► Validate Hash & Replay Stored Response
-                                │
-                                ▼
-                   Database Transaction Commits
-```
+The transaction is committed atomically when exiting the block. If any error occurs or the process is aborted/killed, PostgreSQL automatically rolls back the entire transaction.
 
-This guarantees **atomicity and crash consistency**: if the application or database crash mid-request, Postgres rolls back the transaction. The idempotency key is not saved, and the wallet balance remains unmodified, allowing the client to safely retry the request.
+### Chosen Isolation Level: `READ COMMITTED` with Row Locking
+Rather than using `REPEATABLE READ` or `SERIALIZABLE` isolation (which require complex application-level retry logic to handle serialization aborts under high write concurrency), we use the default `READ COMMITTED` level supplemented by **pessimistic row-level locking**:
+1. We lock the player's wallet row using:
+   `SELECT ... FROM wallets WHERE player_id = :id FOR UPDATE`
+2. Concurrent requests modifying the *same* wallet will block on the lock acquisition until the holding transaction commits or rolls back.
+3. This eliminates concurrency anomalies (like double-spending or balance races) while maintaining high throughput across different player IDs.
 
 ---
 
-## 5. Idempotency Key Retention & Cleanup
+## 4. Idempotency & Request Fingerprinting
 
-* **Retention Period:** Idempotency keys are kept for **24 hours** (configurable via `idempotency_retention_hours`).
-* **Cleanup Mechanism:** A background task runs periodically (default every 1 hour) inside the FastAPI lifespan loop. It executes:
+### Global Idempotency Key Scoping
+Each mutating endpoint requires an `Idempotency-Key` (UUIDv4) header. The keys are globally unique and scoped in the `idempotency_keys` table.
+
+### Request Fingerprinting
+To prevent a client from reusing a key for a different request payload, we compute a SHA-256 fingerprint hash of the request:
+`request_hash = SHA256(HTTP_METHOD + PATH + SERIALIZED_BODY)`
+* **Exact Match Replay:** If the incoming key exists and the stored `request_hash` matches, the system replays the exact response (status code and body).
+* **Payload Mismatch:** If the key exists but the hash differs, the request is rejected with `400 Bad Request` to catch client-side bugs.
+* **In-Flight Conflict:** If the key exists but the transaction has not committed (the response code is `None`), concurrent duplicate requests block or are rejected with `409 Conflict` (if they proceed while in-flight).
+
+### Response Code Replays
+We record both success (e.g., `200 OK`) and failure (e.g., `409 Conflict` for insufficient funds or already-claimed rewards) responses in the database. A duplicate request will receive the exact same response status and content.
+
+---
+
+## 5. Append-Only Ledger & Constraints
+
+* **Non-Negative Balances:** A database check constraint `chk_wallet_balance_non_negative` enforces `balance >= 0` at the physical layer.
+* **Audit Trail:** Every wallet debit or credit writes an audit record to the `ledger` table tracking the change (`amount`) and resulting state (`balance_after`). Ledger consistency is protected by the `chk_ledger_balance_after_non_negative` constraint.
+
+---
+
+## 6. Retention & Cleanup Strategy
+
+* **Retention Period:** Idempotency keys are kept for **24 hours**.
+* **Cleanup Loop:** A background task runs periodically (every 1 hour) inside the FastAPI application lifespan loop. It executes:
   `DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '24 hours'`
-* **Database Performance:** The index on `created_at` (`idx_idempotency_keys_created_at`) ensures that the cleanup query runs quickly without locking large portions of the table.
+* **Indexing:** The `idx_idempotency_keys_created_at` index on the `created_at` column ensures this pruning query executes efficiently without locking large segments of the table.
+
+---
+
+## 7. Tradeoffs & Concurrency Model
+
+* **Locking Latency vs. Serialization Retries:** Locking the wallet row serializes operations for a single player. Under extremely high concurrent requests for the *same* player, requests will queue. However, this is a minor tradeoff compared to the complexity of serialization retries and guarantees absolute safety against double-spending.
+* **Storage Footprint:** Logging all updates to an append-only ledger increases storage requirements over time. However, this ledger is critical for financial auditability and compliance.
