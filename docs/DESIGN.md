@@ -78,8 +78,12 @@
   - We don't have read-write dependencies across multiple rows that would require full serializability.
 
 **Why not `READ COMMITTED`:**
-- `READ COMMITTED` allows non-repeatable reads within a transaction. If we read the balance, then a concurrent transaction commits a debit, our second read of the same row would see the new balance. This could cause subtle bugs in multi-step operations.
-- `REPEATABLE READ` gives us a consistent snapshot for the duration of the transaction.
+- `READ COMMITTED` allows non-repeatable reads within a transaction. Each statement sees the latest committed data, not a consistent snapshot. Consider this race:
+  1. Transaction A reads `balance = 100` (no lock yet)
+  2. Transaction B debits 80, commits → `balance = 20`
+  3. Transaction A re-reads the same row → now sees `balance = 20`
+- With `READ COMMITTED`, if our purchase logic reads the balance in step 1 and then uses it later without re-reading, we're safe because we use `FOR UPDATE` (which blocks step 1 until B commits). However, any additional reads within the transaction could see phantom state changes from concurrent commits. `REPEATABLE READ` eliminates this entire class of bugs by giving every statement within the transaction the same snapshot.
+- `REPEATABLE READ` + `FOR UPDATE` is the sweet spot: consistent reads everywhere, explicit serialization only where needed (the wallet row).
 
 ### Locking Strategy: `SELECT ... FOR UPDATE`
 
@@ -135,7 +139,7 @@ COMMIT;
 
 **On `kill -9` at ANY point before COMMIT:** PostgreSQL rolls back the entire transaction. The wallet, inventory, ledger, and idempotency key are all untouched. On retry, the idempotency key does not exist, so the operation executes fresh — exactly once.
 
-**On `kill -9` AFTER COMMIT:** Everything is durable. On retry, the idempotency key exists, and the stored response is returned.
+**On `kill -9` AFTER COMMIT:** Everything is durable. On retry, the idempotency key exists, the stored response (status code + JSON body) is read and returned verbatim — the client cannot distinguish a replay from the original response.
 
 ---
 
@@ -146,8 +150,29 @@ COMMIT;
 Every mutating request (`POST`) **must** include an `Idempotency-Key` HTTP header containing a UUID v4. The server:
 
 1. Attempts to `INSERT` the key into the `idempotency_keys` table within the same transaction as the business operation.
-2. If `ON CONFLICT` fires (key already exists) → the key is a duplicate. Read the stored response (status code + JSON body) and return it verbatim.
+2. If `ON CONFLICT` fires (key already exists) → the key is a duplicate. Read the **stored response** (status code + JSON body) and **return it verbatim**.
 3. If the insert succeeds → this is the first request. Execute the mutation, store the response alongside the key, commit.
+
+### How Duplicates Return the SAME Response (Not Just a Rejection)
+
+This is a critical distinction. Many idempotency implementations simply reject duplicates with a `409 Conflict` or similar. That is **wrong** for our use case — a client retrying after a timeout doesn't know if the first request succeeded. It needs the **original response** to proceed.
+
+Our approach stores the full response inside the `idempotency_keys` row:
+
+```sql
+-- On first request: mutation + response stored together
+UPDATE idempotency_keys
+SET response_code = 200,
+    response_body = '{"playerId": "p1", "amount": 100, "balance": 250, "reason": "battle_win"}'
+WHERE key = $key;
+COMMIT;
+
+-- On duplicate request: read and replay
+SELECT response_code, response_body FROM idempotency_keys WHERE key = $key;
+-- → Return HTTP 200 with the exact same JSON body
+```
+
+The client receives the **identical** HTTP status code and body on retry. This works for both success responses (200) and business-rule rejections (409 for insufficient funds). If the original request failed with insufficient funds, the retry returns the same 409 — it doesn't re-attempt the purchase.
 
 **Why client-supplied keys (not server-generated):**
 - Server-generated dedup (e.g., hash of `playerId + action + amount`) is fragile. A player could legitimately earn the same amount twice from two different battles.
@@ -223,7 +248,7 @@ CREATE TABLE ledger (
     id            BIGSERIAL PRIMARY KEY,
     player_id     TEXT NOT NULL REFERENCES wallets(player_id),
     amount        INTEGER NOT NULL,
-    balance_after INTEGER NOT NULL,
+    balance_after INTEGER NOT NULL CHECK (balance_after >= 0),
     type          TEXT NOT NULL,
     reason        TEXT NOT NULL DEFAULT '',
     reference_id  TEXT NOT NULL,
@@ -259,9 +284,81 @@ CREATE TABLE idempotency_keys (
 ```
 
 **Key design decisions:**
-- `balance CHECK (balance >= 0)` — PostgreSQL enforces non-negative balances at the storage layer. Even if application logic has a bug, the database will reject a negative balance.
-- `UNIQUE(player_id, reward_id)` — PostgreSQL enforces claim-once at the storage layer. Double-claims are rejected by constraint violation.
 - Integer balances — no floating point. All values are in the smallest currency unit (coins). No rounding errors.
+
+---
+
+## Non-Negative Balance Enforcement (Layered Defense)
+
+Balances can **never** go negative. This is enforced at three layers:
+
+1. **Database constraint (last line of defense):**
+   ```sql
+   balance INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0)
+   ```
+   Even if application logic has a bug, PostgreSQL will reject an `UPDATE` that would make `balance` negative with a `CHECK` constraint violation. The transaction aborts — no partial state.
+
+2. **Pessimistic locking (prevents concurrent double-spend):**
+   ```sql
+   SELECT balance FROM wallets WHERE player_id = $1 FOR UPDATE;
+   ```
+   The `FOR UPDATE` lock ensures that two concurrent purchases on the same wallet serialize. The second transaction blocks until the first commits or rolls back, then sees the updated balance. This prevents two transactions from both reading `balance = 100` and both deducting 80 (resulting in -60).
+
+3. **Application logic (fast rejection):**
+   ```python
+   if wallet.balance < price:
+       raise InsufficientFundsError(...)
+   ```
+   Before issuing the `UPDATE`, the service checks the balance in application code. This provides a clean error message (`409 Conflict` with details) instead of a raw database constraint error.
+
+**Why all three layers:**
+- Layer 3 (app logic) gives good UX but is not sufficient alone — it can't prevent races without Layer 2.
+- Layer 2 (locking) prevents races but doesn't protect against application bugs that skip the check.
+- Layer 1 (DB constraint) is the safety net — even a completely broken application cannot corrupt the balance.
+
+---
+
+## Database Constraints Catalog
+
+Every constraint in the schema, its purpose, and why it exists:
+
+### `wallets` table
+| Constraint | Type | Purpose |
+|------------|------|---------|
+| `player_id` | `PRIMARY KEY` | One wallet per player; lookup key for all operations |
+| `CHECK (balance >= 0)` | `CHECK` | Safety net: balances can never go negative at the storage layer |
+
+### `ledger` table
+| Constraint | Type | Purpose |
+|------------|------|---------|
+| `id` | `PRIMARY KEY (BIGSERIAL)` | Unique, ordered identifier for each ledger entry |
+| `player_id REFERENCES wallets(player_id)` | `FOREIGN KEY` | Referential integrity — no orphaned ledger entries |
+| `CHECK (balance_after >= 0)` | `CHECK` | Redundant safety: recorded balance-after should also be non-negative |
+| `INDEX (player_id)` | `INDEX` | Fast lookups for a player's transaction history |
+| `INDEX (reference_id)` | `INDEX` | Fast lookup by idempotency key (for audit/debugging) |
+
+### `inventory` table
+| Constraint | Type | Purpose |
+|------------|------|---------|
+| `id` | `PRIMARY KEY (BIGSERIAL)` | Unique identifier for each inventory entry |
+| `player_id REFERENCES wallets(player_id)` | `FOREIGN KEY` | Referential integrity — no orphaned items |
+| `INDEX (player_id)` | `INDEX` | Fast listing of a player's items |
+
+**Inventory uniqueness decision:** A player **can** own multiple copies of the same `item_id`. This is intentional — in most game economies, buying a sword twice gives you two swords (stackable items, gifts, etc.). There is no `UNIQUE(player_id, item_id)` constraint. If a game design required unique items, we would add it, but the default should be permissive.
+
+### `rewards_claimed` table
+| Constraint | Type | Purpose |
+|------------|------|---------|
+| `id` | `PRIMARY KEY (BIGSERIAL)` | Unique identifier for each claim record |
+| `player_id REFERENCES wallets(player_id)` | `FOREIGN KEY` | Referential integrity |
+| `UNIQUE (player_id, reward_id)` | `UNIQUE` | **Claim-once enforcement at the database layer.** A second `INSERT` for the same (player, reward) pair fails with a unique constraint violation. Combined with idempotency keys, retries of the same claim are safe. |
+| `INDEX (player_id)` | `INDEX` | Fast listing of a player's claimed rewards |
+
+### `idempotency_keys` table
+| Constraint | Type | Purpose |
+|------------|------|---------|
+| `key` | `PRIMARY KEY` | **Globally unique idempotency key.** The `ON CONFLICT (key) DO NOTHING` pattern detects duplicates in a single atomic statement. |
+| `INDEX (created_at)` | `INDEX` | Fast cleanup of expired keys by the background pruning task |
 
 ---
 
