@@ -1,18 +1,18 @@
-# Binaries
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
 
-# Test binary
-*.test
+# Virtual environments
+.venv/
+venv/
+env/
 
-# Output of go coverage
-*.out
-
-# Go workspace file
-go.work
+# Distribution / packaging
+*.egg-info/
+*.egg
+dist/
+build/
 
 # IDE
 .idea/
@@ -28,10 +28,13 @@ Thumbs.db
 # Environment
 .env
 
-# Build artifacts
-/bin/
-/dist/
-/tmp/
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# mypy
+.mypy_cache/
 
 # Docker volumes (local dev)
 pgdata/

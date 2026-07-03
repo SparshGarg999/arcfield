@@ -1,31 +1,21 @@
-# Multi-stage build for minimal production image.
-# Stage 1: Build the Go binary
-FROM golang:1.23-alpine AS builder
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# Copy go module files first for layer caching
-COPY go.mod go.sum* ./
-RUN go mod download 2>/dev/null || true
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy dependency files first for layer caching
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir .
 
 # Copy source code
 COPY . .
 
-# Download dependencies (in case go.sum doesn't exist yet)
-RUN go mod tidy
-
-# Build static binary with CGO disabled
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /arcfield ./cmd/server
-
-# Stage 2: Minimal runtime image
-FROM alpine:3.20
-
-RUN apk --no-cache add ca-certificates tzdata
-
-WORKDIR /app
-
-COPY --from=builder /arcfield .
+# Re-install with source (editable not needed in production)
+RUN pip install --no-cache-dir .
 
 EXPOSE 8080
 
-ENTRYPOINT ["/app/arcfield"]
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080"]
