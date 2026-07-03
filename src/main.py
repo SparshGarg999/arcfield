@@ -9,7 +9,7 @@ import logging
 import uuid
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Header, status
+from fastapi import Depends, FastAPI, HTTPException, Header, Path, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -17,8 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.database import AsyncSessionLocal, get_db
-from src.models import IdempotencyKey, LedgerEntry, Wallet
-from src.schemas import CreditRequest, CreditResponse, ErrorResponse, WalletResponse
+from src.models import IdempotencyKey, LedgerEntry, Wallet, InventoryItem
+from src.schemas import CreditRequest, CreditResponse, ErrorResponse, WalletResponse, PurchaseRequest, PurchaseResponse
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -89,7 +89,7 @@ async def health() -> dict[str, str]:
     },
 )
 async def get_wallet(
-    playerId: str,
+    playerId: str = Path(..., max_length=128, pattern=r"^[a-zA-Z0-9_\-]+$"),
     db: AsyncSession = Depends(get_db),
 ) -> WalletResponse:
     """Retrieves the wallet details (balance) for a given player."""
@@ -118,8 +118,8 @@ async def get_wallet(
     },
 )
 async def credit_wallet(
-    playerId: str,
     request_data: CreditRequest,
+    playerId: str = Path(..., max_length=128, pattern=r"^[a-zA-Z0-9_\-]+$"),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
     db: AsyncSession = Depends(get_db),
 ) -> Any:
@@ -212,6 +212,11 @@ async def credit_wallet(
 
             # Update the balance
             new_balance = wallet.balance + request_data.amount
+            if new_balance > 2147483647:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Wallet balance would overflow maximum allowed value (2147483647).",
+                )
             wallet.balance = new_balance
 
             # Add to append-only ledger
@@ -255,3 +260,191 @@ async def credit_wallet(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database transaction failed: {str(e)}",
         ) from e
+
+
+@app.post(
+    "/v1/wallets/{playerId}/purchase",
+    response_model=PurchaseResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Bad Request"},
+        409: {"model": ErrorResponse, "description": "Conflict / Insufficient Funds / In-flight"},
+    },
+)
+async def purchase_item(
+    request_data: PurchaseRequest,
+    playerId: str = Path(..., max_length=128, pattern=r"^[a-zA-Z0-9_\-]+$"),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Debits a player's wallet and grants an item, enforcing transactional safety and idempotency."""
+    # 1. Validate Idempotency-Key header is present
+    if not idempotency_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Idempotency-Key header is required.",
+        )
+
+    # Validate Idempotency-Key header is a valid UUID
+    try:
+        uuid.UUID(idempotency_key)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Idempotency-Key must be a valid UUID.",
+        ) from e
+
+    # 2. Compute request fingerprint hash
+    req_body = request_data.model_dump()
+    request_hash = compute_request_hash("POST", f"/v1/wallets/{playerId}/purchase", req_body)
+
+    error_to_raise = None
+    response_to_return = None
+
+    try:
+        # 3. Perform idempotency check & business operation in the same transaction
+        async with db.begin():
+            # Try to insert the idempotency key first
+            stmt = (
+                pg_insert(IdempotencyKey)
+                .values(
+                    key=idempotency_key,
+                    player_id=playerId,
+                    operation="purchase",
+                    request_hash=request_hash,
+                )
+                .on_conflict_do_nothing()
+                .returning(
+                    IdempotencyKey.key,
+                    IdempotencyKey.response_code,
+                    IdempotencyKey.response_body,
+                )
+            )
+            result = await db.execute(stmt)
+            inserted_row = result.first()
+
+            if inserted_row is None:
+                # Key already exists. Fetch the committed record to replay or check if in-flight.
+                existing = await db.get(IdempotencyKey, idempotency_key)
+                if existing is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Idempotency conflict resolution failed.",
+                    )
+
+                # Validate payload fingerprint match
+                if existing.request_hash != request_hash:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Idempotency-Key was reused with a different request payload.",
+                    )
+
+                # If code is null, another concurrent request with the same key is currently processing
+                if existing.response_code is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="A request with this Idempotency-Key is already in progress.",
+                    )
+
+                # Replay stored response
+                stored_response = json.loads(existing.response_body)
+                response_to_return = JSONResponse(
+                    status_code=existing.response_code,
+                    content=stored_response,
+                )
+                return
+
+            # New request: Proceed with purchase
+            # Ensure the wallet exists (Get or create pattern)
+            wallet_insert = (
+                pg_insert(Wallet)
+                .values(player_id=playerId, balance=0)
+                .on_conflict_do_nothing()
+            )
+            await db.execute(wallet_insert)
+
+            # Select and lock the wallet row for update
+            wallet_select = select(Wallet).where(Wallet.player_id == playerId).with_for_update()
+            wallet_result = await db.execute(wallet_select)
+            wallet = wallet_result.scalar_one()
+
+            # Check for sufficient funds
+            if wallet.balance < request_data.price:
+                error_detail = f"Insufficient funds: balance {wallet.balance} is less than price {request_data.price}."
+                error_body = {"detail": error_detail}
+                serialized_error = json.dumps(error_body)
+
+                # Save 409 response in idempotency key
+                update_key = (
+                    update(IdempotencyKey)
+                    .where(IdempotencyKey.key == idempotency_key)
+                    .values(
+                        response_code=status.HTTP_409_CONFLICT,
+                        response_body=serialized_error,
+                    )
+                )
+                await db.execute(update_key)
+
+                error_to_raise = HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=error_detail,
+                )
+                return
+
+            # Debit wallet
+            new_balance = wallet.balance - request_data.price
+            wallet.balance = new_balance
+
+            # Grant inventory item
+            item = InventoryItem(
+                player_id=playerId,
+                item_id=request_data.item_id,
+            )
+            db.add(item)
+
+            # Add to append-only ledger (with negative amount)
+            ledger_entry = LedgerEntry(
+                player_id=playerId,
+                amount=-request_data.price,
+                balance_after=new_balance,
+                type="purchase_debit",
+                reason=f"Purchase of {request_data.item_id}",
+                reference_id=idempotency_key,
+            )
+            db.add(ledger_entry)
+
+            # Construct successful response
+            response_data = PurchaseResponse(
+                player_id=playerId,
+                balance=new_balance,
+                item_id=request_data.item_id,
+                reference_id=idempotency_key,
+            )
+            serialized_response = json.dumps(response_data.model_dump())
+
+            # Save 200 response in idempotency key
+            update_key = (
+                update(IdempotencyKey)
+                .where(IdempotencyKey.key == idempotency_key)
+                .values(
+                    response_code=status.HTTP_200_OK,
+                    response_body=serialized_response,
+                )
+            )
+            await db.execute(update_key)
+            response_to_return = response_data
+
+    except HTTPException:
+        # Re-raise HTTP exceptions to let FastAPI handle them
+        raise
+    except Exception as e:
+        logger.error("Database transaction error during purchase: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database transaction failed: {str(e)}",
+        ) from e
+
+    # Raise insufficient funds error if set
+    if error_to_raise:
+        raise error_to_raise
+
+    return response_to_return
