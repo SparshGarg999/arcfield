@@ -53,6 +53,24 @@ class PurchaseResponse(BaseModel):
     reference_id: str = Field(..., description="The idempotency key reference associated with the operation.")
 
 
+class ClaimRewardRequest(BaseModel):
+    """Schema for reward claim request."""
+    player_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="ID of the player claiming the reward.",
+        examples=["player_123"],
+    )
+
+
+class ClaimRewardResponse(BaseModel):
+    """Schema for successful reward claim response."""
+    player_id: str = Field(..., description="The ID of the player.")
+    reward_id: str = Field(..., description="The ID of the reward claimed.")
+    reference_id: str = Field(..., description="The idempotency key reference associated with the operation.")
+
+
 class ErrorResponse(BaseModel):
     """Schema for error responses."""
     detail: str = Field(..., description="Detail message explaining the error.")
