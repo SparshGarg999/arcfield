@@ -351,7 +351,7 @@ async def purchase_item(
                     status_code=existing.response_code,
                     content=stored_response,
                 )
-                return
+                return response_to_return
 
             # New request: Proceed with purchase
             # Ensure the wallet exists (Get or create pattern)
@@ -388,50 +388,49 @@ async def purchase_item(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=error_detail,
                 )
-                return
+            else:
+                # Debit wallet
+                new_balance = wallet.balance - request_data.price
+                wallet.balance = new_balance
 
-            # Debit wallet
-            new_balance = wallet.balance - request_data.price
-            wallet.balance = new_balance
-
-            # Grant inventory item
-            item = InventoryItem(
-                player_id=playerId,
-                item_id=request_data.item_id,
-            )
-            db.add(item)
-
-            # Add to append-only ledger (with negative amount)
-            ledger_entry = LedgerEntry(
-                player_id=playerId,
-                amount=-request_data.price,
-                balance_after=new_balance,
-                type="purchase_debit",
-                reason=f"Purchase of {request_data.item_id}",
-                reference_id=idempotency_key,
-            )
-            db.add(ledger_entry)
-
-            # Construct successful response
-            response_data = PurchaseResponse(
-                player_id=playerId,
-                balance=new_balance,
-                item_id=request_data.item_id,
-                reference_id=idempotency_key,
-            )
-            serialized_response = json.dumps(response_data.model_dump())
-
-            # Save 200 response in idempotency key
-            update_key = (
-                update(IdempotencyKey)
-                .where(IdempotencyKey.key == idempotency_key)
-                .values(
-                    response_code=status.HTTP_200_OK,
-                    response_body=serialized_response,
+                # Grant inventory item
+                item = InventoryItem(
+                    player_id=playerId,
+                    item_id=request_data.item_id,
                 )
-            )
-            await db.execute(update_key)
-            response_to_return = response_data
+                db.add(item)
+
+                # Add to append-only ledger (with negative amount)
+                ledger_entry = LedgerEntry(
+                    player_id=playerId,
+                    amount=-request_data.price,
+                    balance_after=new_balance,
+                    type="purchase_debit",
+                    reason=f"Purchase of {request_data.item_id}",
+                    reference_id=idempotency_key,
+                )
+                db.add(ledger_entry)
+
+                # Construct successful response
+                response_data = PurchaseResponse(
+                    player_id=playerId,
+                    balance=new_balance,
+                    item_id=request_data.item_id,
+                    reference_id=idempotency_key,
+                )
+                serialized_response = json.dumps(response_data.model_dump())
+
+                # Save 200 response in idempotency key
+                update_key = (
+                    update(IdempotencyKey)
+                    .where(IdempotencyKey.key == idempotency_key)
+                    .values(
+                        response_code=status.HTTP_200_OK,
+                        response_body=serialized_response,
+                    )
+                )
+                await db.execute(update_key)
+                response_to_return = response_data
 
     except HTTPException:
         # Re-raise HTTP exceptions to let FastAPI handle them
