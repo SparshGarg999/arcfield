@@ -17,8 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.database import AsyncSessionLocal, get_db
-from src.models import IdempotencyKey, LedgerEntry, Wallet, InventoryItem
-from src.schemas import CreditRequest, CreditResponse, ErrorResponse, WalletResponse, PurchaseRequest, PurchaseResponse
+from src.models import IdempotencyKey, LedgerEntry, Wallet, InventoryItem, ClaimedReward
+from src.schemas import CreditRequest, CreditResponse, ErrorResponse, WalletResponse, PurchaseRequest, PurchaseResponse, ClaimRewardRequest, ClaimRewardResponse
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -443,6 +443,183 @@ async def purchase_item(
         ) from e
 
     # Raise insufficient funds error if set
+    if error_to_raise:
+        raise error_to_raise
+
+    return response_to_return
+
+
+@app.post(
+    "/v1/rewards/{rewardId}/claim",
+    response_model=ClaimRewardResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Bad Request"},
+        409: {"model": ErrorResponse, "description": "Conflict / Reward already claimed / In-flight"},
+    },
+)
+async def claim_reward(
+    request_data: ClaimRewardRequest,
+    rewardId: str = Path(..., max_length=128, pattern=r"^[a-zA-Z0-9_\-]+$"),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Claims a unique reward for a player, enforcing idempotency and safety constraints."""
+    # 1. Validate Idempotency-Key header is present
+    if not idempotency_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Idempotency-Key header is required.",
+        )
+
+    # Validate Idempotency-Key header is a valid UUID
+    try:
+        uuid.UUID(idempotency_key)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Idempotency-Key must be a valid UUID.",
+        ) from e
+
+    # 2. Compute request fingerprint hash
+    req_body = request_data.model_dump()
+    request_hash = compute_request_hash("POST", f"/v1/rewards/{rewardId}/claim", req_body)
+
+    error_to_raise = None
+    response_to_return = None
+
+    try:
+        # 3. Perform idempotency check & business operation in the same transaction
+        async with db.begin():
+            # Try to insert the idempotency key first
+            stmt = (
+                pg_insert(IdempotencyKey)
+                .values(
+                    key=idempotency_key,
+                    player_id=request_data.player_id,
+                    operation="claim_reward",
+                    request_hash=request_hash,
+                )
+                .on_conflict_do_nothing()
+                .returning(
+                    IdempotencyKey.key,
+                    IdempotencyKey.response_code,
+                    IdempotencyKey.response_body,
+                )
+            )
+            result = await db.execute(stmt)
+            inserted_row = result.first()
+
+            if inserted_row is None:
+                # Key already exists. Fetch the committed record to replay or check if in-flight.
+                existing = await db.get(IdempotencyKey, idempotency_key)
+                if existing is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Idempotency conflict resolution failed.",
+                    )
+
+                # Validate payload fingerprint match
+                if existing.request_hash != request_hash:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Idempotency-Key was reused with a different request payload.",
+                    )
+
+                # If code is null, another concurrent request with the same key is currently processing
+                if existing.response_code is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="A request with this Idempotency-Key is already in progress.",
+                    )
+
+                # Replay stored response
+                stored_response = json.loads(existing.response_body)
+                response_to_return = JSONResponse(
+                    status_code=existing.response_code,
+                    content=stored_response,
+                )
+                return response_to_return
+
+            # New request: Proceed with claiming reward
+            # Ensure the wallet exists (Get or create pattern)
+            wallet_insert = (
+                pg_insert(Wallet)
+                .values(player_id=request_data.player_id, balance=0)
+                .on_conflict_do_nothing()
+            )
+            await db.execute(wallet_insert)
+
+            # Select and lock the wallet row for update to serialize player mutations
+            wallet_select = select(Wallet).where(Wallet.player_id == request_data.player_id).with_for_update()
+            await db.execute(wallet_select)
+
+            # Check if reward has already been claimed
+            claim_select = select(ClaimedReward).where(
+                ClaimedReward.player_id == request_data.player_id,
+                ClaimedReward.reward_id == rewardId,
+            )
+            claim_result = await db.execute(claim_select)
+            existing_claim = claim_result.scalar_one_or_none()
+
+            if existing_claim is not None:
+                error_detail = f"Reward {rewardId} has already been claimed by player {request_data.player_id}."
+                error_body = {"detail": error_detail}
+                serialized_error = json.dumps(error_body)
+
+                # Save 409 response in idempotency key
+                update_key = (
+                    update(IdempotencyKey)
+                    .where(IdempotencyKey.key == idempotency_key)
+                    .values(
+                        response_code=status.HTTP_409_CONFLICT,
+                        response_body=serialized_error,
+                    )
+                )
+                await db.execute(update_key)
+
+                error_to_raise = HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=error_detail,
+                )
+            else:
+                # Grant reward
+                reward = ClaimedReward(
+                    player_id=request_data.player_id,
+                    reward_id=rewardId,
+                )
+                db.add(reward)
+
+                # Construct successful response
+                response_data = ClaimRewardResponse(
+                    player_id=request_data.player_id,
+                    reward_id=rewardId,
+                    reference_id=idempotency_key,
+                )
+                serialized_response = json.dumps(response_data.model_dump())
+
+                # Save 200 response in idempotency key
+                update_key = (
+                    update(IdempotencyKey)
+                    .where(IdempotencyKey.key == idempotency_key)
+                    .values(
+                        response_code=status.HTTP_200_OK,
+                        response_body=serialized_response,
+                    )
+                )
+                await db.execute(update_key)
+                response_to_return = response_data
+
+    except HTTPException:
+        # Re-raise HTTP exceptions to let FastAPI handle them
+        raise
+    except Exception as e:
+        logger.error("Database transaction error during reward claim: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database transaction failed: {str(e)}",
+        ) from e
+
+    # Raise duplicate claim error if set
     if error_to_raise:
         raise error_to_raise
 
