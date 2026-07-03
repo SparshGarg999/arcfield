@@ -178,6 +178,7 @@ class IdempotencyKey(Base):
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
     player_id: Mapped[str] = mapped_column(String(128), nullable=False)
     operation: Mapped[str] = mapped_column(String(64), nullable=False)  # 'credit', 'purchase', 'claim_reward'
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)  # SHA-256 hash of method + path + body
     response_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     response_body: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
