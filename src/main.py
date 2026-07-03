@@ -9,7 +9,7 @@ import logging
 import uuid
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Header, Path, status
+from fastapi import Depends, FastAPI, HTTPException, Header, Path, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -118,6 +118,7 @@ async def get_wallet(
     },
 )
 async def credit_wallet(
+    request: Request,
     request_data: CreditRequest,
     playerId: str = Path(..., max_length=128, pattern=r"^[a-zA-Z0-9_\-]+$"),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
@@ -230,6 +231,11 @@ async def credit_wallet(
             )
             db.add(ledger_entry)
 
+            # Simulate a slow transaction or crash point
+            if settings.testing and request.headers.get("X-Test-Sleep-Ms"):
+                sleep_ms = int(request.headers.get("X-Test-Sleep-Ms"))
+                await asyncio.sleep(sleep_ms / 1000.0)
+
             # Construct response and serialize
             response_data = CreditResponse(
                 player_id=playerId,
@@ -271,6 +277,7 @@ async def credit_wallet(
     },
 )
 async def purchase_item(
+    request: Request,
     request_data: PurchaseRequest,
     playerId: str = Path(..., max_length=128, pattern=r"^[a-zA-Z0-9_\-]+$"),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
@@ -411,6 +418,11 @@ async def purchase_item(
                 )
                 db.add(ledger_entry)
 
+                # Simulate a slow transaction or crash point
+                if settings.testing and request.headers.get("X-Test-Sleep-Ms"):
+                    sleep_ms = int(request.headers.get("X-Test-Sleep-Ms"))
+                    await asyncio.sleep(sleep_ms / 1000.0)
+
                 # Construct successful response
                 response_data = PurchaseResponse(
                     player_id=playerId,
@@ -458,6 +470,7 @@ async def purchase_item(
     },
 )
 async def claim_reward(
+    request: Request,
     request_data: ClaimRewardRequest,
     rewardId: str = Path(..., max_length=128, pattern=r"^[a-zA-Z0-9_\-]+$"),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
@@ -588,6 +601,11 @@ async def claim_reward(
                     reward_id=rewardId,
                 )
                 db.add(reward)
+
+                # Simulate a slow transaction or crash point
+                if settings.testing and request.headers.get("X-Test-Sleep-Ms"):
+                    sleep_ms = int(request.headers.get("X-Test-Sleep-Ms"))
+                    await asyncio.sleep(sleep_ms / 1000.0)
 
                 # Construct successful response
                 response_data = ClaimRewardResponse(
