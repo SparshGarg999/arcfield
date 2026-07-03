@@ -1,13 +1,13 @@
 """Smoke test to verify the test harness works."""
 
-from fastapi.testclient import TestClient
+import pytest
+from httpx import AsyncClient
 
-from src.main import app
-
-client = TestClient(app)
+pytestmark = pytest.mark.asyncio
 
 
-def test_health_returns_200():
-    response = client.get("/health")
+async def test_health_returns_200(client: AsyncClient) -> None:
+    """Verifies that the health check endpoint returns 200."""
+    response = await client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "healthy"}
